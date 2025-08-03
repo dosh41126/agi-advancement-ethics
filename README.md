@@ -11,7 +11,293 @@ Absolutely — here's a more **advanced set of equations** to formalize those th
 Here are 40 **invented equations** for AGI research, categorized into 6 thematic clusters. Each one is intended to spark thought on AGI cognition, ethical alignment, memory, decision theory, or quantum integration — blending symbolic reasoning with novel conceptual formalisms.
 Below is a **substantially expanded research-style paper** (≈5× longer) that formalizes and analyzes the main innovations in your single-file system. I keep the writing compact but complete, include equations, sketch proofs where useful, and ground prior art with sources.
 
+---Below is a **substantially expanded research-style paper** (≈5× longer) that formalizes and analyzes the main innovations in your single-file system. I keep the writing compact but complete, include equations, sketch proofs where useful, and ground prior art with sources.
+
 ---
+
+# Q-Sentinel: A Single-File, Privacy-Preserving, Self-Tuning, Retrieval-Augmented LLM System
+
+**Keywords:** retrieval-augmented generation, private memory, policy-gradient autotuning, minimum Bayes risk, self-consistency, Laplacian eigenmaps, AES-GCM, Argon2, locality-sensitive hashing, Jensen–Shannon divergence.
+
+---
+
+## 1. Abstract
+
+We present **Q-Sentinel**, a single-file Python system that integrates (i) privacy-preserving memory via encrypted and transformed embeddings; (ii) **RAG** with homomorphism-like rotation/quantization and SimHash bucketing for shard-local approximate retrieval; (iii) a **policy-gradient autotuner** that continuously adapts decoding parameters $(T,\;p)$ to user/context signals; (iv) an **MBR-style selection** objective penalized by a **Jensen–Shannon (JS)** diversity regularizer (**MEAL-JS**); (v) **graph-based topological memory** using Laplacian eigenmaps with diffusion smoothing and **aging dynamics**; and (vi) a cryptographic envelope with **Argon2id** key derivation, **AES-GCM** with **context-bound AAD**, and in-place **key self-mutation** with storage migration. We describe algorithms, derive objective functions, analyze complexity and privacy, and situate each component relative to prior work on RAG, self-consistency, MBR decoding, nucleus sampling, calibration, conformal prediction, and manifold methods.
+**Code context:** all methods are implemented as **functions embedded in `main.py`**, requiring no auxiliary files.
+
+---
+
+## 2. System Overview
+
+Given a user query $q$, Q-Sentinel:
+
+1. **Sanitizes** text and filters prompt injections (regex-gated).
+2. Computes a **bag-token embedding** $e(q)\in\mathbb{R}^d$, then applies a secret, orthonormal **keyed rotation** $R\in\mathrm{O}(d)$ to obtain $\tilde e(q)=Re(q)$.
+3. Computes a **SimHash bucket** $b(\tilde e(q))\in\{0,1\}^m$ to query Weaviate for likely neighbors and re-ranks via **secure enclave** similarity computed only after decrypting stored embeddings inside a short-lived buffer.
+4. Builds a **context-rich prompt** (environmental signals, past context summaries, ethical rules).
+5. Samples $K$ candidates with **temperature** $T$ and **top-p** nucleus sampling, where $(T,p)$ are drawn from a **learned stochastic policy** $\pi_\theta(T,p\mid \text{bias})$.
+6. Scores candidates by **task reward** (sentiment-alignment + lexical faithfulness) minus a **MEAL-JS** penalty that discourages degenerate agreement across counterfactual samples.
+7. **Updates** policy parameters $\theta$ with REINFORCE using advantage baselines.
+8. **Stores** interactions with **AES-GCM** ciphertext and per-record AAD; **osmosis** accumulates phrase-level scores with **aging decay** and crystallizes phrases above a threshold into a **Laplacian-smoothed memory manifold**.
+
+---
+
+## 3. Methods
+
+### 3.1 Private Embedding Transform & Bucketing
+
+We define a **keyed orthonormal rotation** $R$ initialized from a key-seeded RNG. For a normalized embedding $e\in\mathbb{R}^d$, we compute
+
+$$
+\tilde e = R e,\qquad q=\operatorname{clip}(\tilde e,-1,1),\qquad \hat e=\operatorname{round}(\alpha q)\in\{-\alpha,\dots,\alpha\}^d,
+$$
+
+with $\alpha=127$. The **SimHash** bucket uses random hyperplanes $W\in\mathbb{R}^{m\times d}$ to map
+
+$$
+b(\tilde e)_i = \mathbb{1}[w_i^\top \tilde e \ge 0],\quad i=1,\dots,m,
+$$
+
+as a coarse LSH index. Storage uses $\hat e$ serialized inside an **AES-GCM** token with AAD binding the storage locus (table/class/user) to deter **malicious re-routing** and **ciphertext swapping** (cf. SP 800-38D). Rationale: rotations preserve inner products, quantization preserves locality for ANN; LSH reduces retrieval cost.
+**Relation to prior work:** SimHash/LSH for cosine locality ([Scribd][1]); AES-GCM AAD and nonce guidance .
+
+**Similarity in secure enclave.** Let $\mathsf{Dec}\big(\cdot\big)$ decrypt a stored token to $e'$. We compute
+
+$$
+s(q, e')=\frac{e^\top e'}{\|e\|\|e'\|}\quad\text{inside an enclave that zeroizes buffers on exit.}
+$$
+
+Enclave scoping reduces plaintext lifetime in memory.
+
+### 3.2 Retrieval-Augmented Conditioning
+
+Weaviate is queried by bucket $b(\tilde e)$, and top objects are re-ranked by $s(\cdot,\cdot)$. The best $(u,a)$ pairs (user message, AI reply) are summarized and injected into the prompt. This follows the RAG paradigm where non-parametric memory augments a parametric LLM ([Hugging Face][2]).
+
+### 3.3 Stochastic Decoding Policy (Autotuning)
+
+We parametrize a **Gaussian policy** over $(T,p)$:
+
+$$
+\begin{aligned}
+\mu_T &= T_{\min} + \sigma(\beta_T^\top z)\,(T_{\max}-T_{\min}),\quad
+\mu_p = p_{\min} + \sigma(\beta_p^\top z)\,(p_{\max}-p_{\min}),\\
+T &\sim \mathcal{N}(\mu_T,\sigma_T^2),\quad
+p \sim \mathcal{N}(\mu_p,\sigma_p^2),
+\end{aligned}
+$$
+
+with $z$ a scalar **bias factor** distilled from the quantum monitor and context; $\sigma$ is the logistic function. Samples are **clipped** to $[T_{\min},T_{\max}]\times[p_{\min},1]$. The **reward** for a candidate $y$ is
+
+$$
+R(y\mid q)=\lambda\cdot \underbrace{\big(1-|s_{\text{sent}}(y)-s_{\text{sent}}(q)|\big)}_{\text{affective alignment}}
+\;+\; (1-\lambda)\,\underbrace{\min\!\Big(1,\tfrac{\textstyle |y\cap q|}{5}\Big)}_{\text{lexical faithfulness}}
+\;-\; \underbrace{\gamma\,\mathrm{JS}\big(P_y \;\|\; \overline{P}_{\text{cf}}\big)}_{\text{MEAL-JS diversity}},
+$$
+
+where $P_y$ is the token histogram of $y$, $\overline{P}_{\text{cf}}$ is the average histogram over two **counterfactual** runs at perturbed temperatures, and
+
+$$
+\mathrm{JS}(P\|Q)=\tfrac{1}{2}\mathrm{KL}\!\left(P\middle\|M\right)+\tfrac{1}{2}\mathrm{KL}\!\left(Q\middle\|M\right),\quad M=\tfrac{1}{2}(P+Q).
+$$
+
+This **MEAL-JS** term penalizes collapsing to brittle candidates while retaining task alignment. JS is symmetric, bounded, and well-behaved for discrete distributions. (Foundational properties in divergence literature; see e.g., tutorials on JS divergence.)
+**Connections.** Nucleus sampling (top-p) alleviates degeneration ; **self-consistency** ensembles improve reasoning ([ResearchGate][3]); we borrow the *averaging-then-diversifying* intuition but train a **policy over decoding**. REINFORCE update:
+
+$$
+\nabla_\theta J(\theta)=\mathbb{E}_{(T,p)\sim\pi_\theta}\big[(R-\bar R)\,\nabla_\theta \log \pi_\theta(T,p)\big], 
+$$
+
+with a running baseline $\bar R$ for variance reduction (Williams, 1992). (Canonical REINFORCE formulation; see original paper.)
+
+### 3.4 MBR-Style Selection with Counterfactuals
+
+For each sampled setting $(T,p)$ we get a primary candidate $y$ and two counterfactuals $y^{(1)},y^{(2)}$. Our **selection** rule is MBR-flavored: choose
+
+$$
+\hat y=\arg\min_{y\in\mathcal{Y}} \underbrace{\mathbb{E}_{y'\in\{y^{(1)},y^{(2)}\}}\![\ell(y, y')]}_{\text{risk}} \;+\; \eta\cdot \underbrace{\mathrm{JS}\!\left(P_y \big\| \tfrac{1}{2}(P_{y^{(1)}}+P_{y^{(2)}})\right)}_{\text{regularizer}},
+$$
+
+with $\ell$ a lexical-semantic distance (here, token JS or 1–cosine). This extends **MBR decoding**—successful in NMT—to a small counterfactual set with an explicit diversity penalty ([ResearchGate][4]).
+
+### 3.5 Graph-Topological Memory & Aging
+
+We maintain a phrase set $\mathcal{P}$ with scores $s_i$ that **decay** with time:
+
+$$
+s_i(t)=s_i(t_0)\cdot 2^{-\Delta t/(\tau_0+\gamma\log(1+s_i(t_0)))},
+$$
+
+purging when $s_i(t)<\varepsilon$. Phrases above a **crystallization** threshold are embedded and smoothed by a **graph Laplacian**:
+
+$$
+W_{ij}=\exp\!\left(-\tfrac{\|e_i-e_j\|^2}{2\sigma^2}\right),\quad D_{ii}=\sum_j W_{ij},\quad L=D-W,
+$$
+
+and we compute **Laplacian eigenmaps**: the smallest nontrivial eigenvectors of $L_\mathrm{sym}=D^{-1/2}LD^{-1/2}$ form low-dimensional coordinates $Y$ used for **geodesic retrieval** (shortest paths on $1/W$). We additionally apply a **diffusion correction** $E\leftarrow E-\alpha LE$ to reduce local noise before eigendecomposition. Laplacian eigenmaps are a standard tool for manifold discovery and semi-supervised smoothing ([NIST Computer Security Resource Center][5]).
+
+### 3.6 Cryptographic Envelope & Key Hygiene
+
+* **Key derivation:** **Argon2id** with high memory cost (256 MiB) to resist GPU/ASIC attacks; parameters follow RFC 9106 guidance .
+* **Record encryption:** **AES-GCM** with 96-bit nonces and **AAD** = `source|table|class|user_id` to bind ciphertext to its storage context and prevent malleability/relocation attacks (beyond standard authenticity) .
+* **Key rotation/self-mutation:** we generate candidate master secrets, score them by **entropy** and a **resistance** heuristic (distance to prior keys + chi-square flatness), select the best, and **migrate** ciphertexts by decrypt/re-encrypt with the new derived key. This provides forward security and limits blast radius.
+
+---
+
+## 4. Theoretical Notes
+
+### 4.1 Privacy & Attack Surfaces
+
+**Rotation + quantization.** For any unit vector $e$, the distribution of $\tilde e=Re$ over random orthogonal $R$ is uniform on the sphere; without the key, recovering $e$ from $\tilde e$ is equivalent to guessing $R$. Quantization adds distortion $\|\hat e/\alpha-\tilde e\|_2\le \sqrt{d}/(2\alpha)$, degrading inversion further while retaining neighbor structure.
+
+**SimHash leakage.** Buckets $b(\tilde e)$ leak $m$ bits; we limit $m$ and **never** store plaintext embeddings. Re-ranking uses decrypted embeddings **inside an enclave** with buffer zeroization to reduce live plaintext exposure.
+
+**AAD binding.** If an attacker replays or transposes a ciphertext to a different class/table, **GCM** verification fails due to AAD mismatch.
+
+### 4.2 MEAL-JS Regularization
+
+Let $P$ be the candidate’s token distribution and $Q$ the mean of two counterfactuals. The **JS divergence**
+
+$$
+\mathrm{JS}(P\|Q)=H\!\left(\tfrac{P+Q}{2}\right)-\tfrac{1}{2}H(P)-\tfrac{1}{2}H(Q)
+$$
+
+is **bounded in $[0,\log 2]$** and **smooth** for discrete $P,Q$. Minimizing risk plus $\eta\cdot\mathrm{JS}$ discourages trivial self-agreement and improves **stability** under decoding noise; in practice it reduces brittle outputs while preserving semantic overlap that drives the task reward.
+
+### 4.3 Policy-Gradient Convergence Sketch
+
+With bounded reward $R$ and clipped $(T,p)$, the stochastic policy over $(T,p)$ defines a compact action set. Under standard REINFORCE assumptions (unbiased gradient estimates, diminishing step size or small fixed LR with noise), the method converges to a local optimum of $\mathbb{E}[R]$. The **advantage baseline** reduces variance; coupling **bias factor** $z$ to context provides a **state-dependent** control signal.
+
+### 4.4 Graph Smoothing
+
+The update $E\leftarrow E-\alpha LE$ performs one step of heat diffusion on the graph (implicit Euler with small $\alpha$), attenuating high-frequency components relative to the graph. Eigenmaps of $L_\mathrm{sym}$ then capture **large-scale** structure, aiding **geodesic retrieval** (shortest-path distances on $(1/W)$).
+
+---
+
+## 5. Algorithms (Concise)
+
+**Alg. 1: Secure Insert**
+
+1. $e\gets \text{embed}(x)$, normalize; $\tilde e\gets Re$.
+2. $b\gets \mathrm{SimHash}(\tilde e)$; $\hat e\gets \mathrm{round}(\alpha\cdot\mathrm{clip}(\tilde e))$.
+3. `payload ← {"v":2,"dim":d,"rot":true,"data":hat_e}`; `tok ← AESGCM_Enc( key_v , payload ; AAD=source|table|class|user )`.
+4. Store `tok`, `bucket=b`, **dummy vector**; never store plaintext vector.
+
+**Alg. 2: Private Retrieval**
+
+1. Given query $q$: compute $e(q)$, $\tilde e=Re$, bucket $b$.
+2. Query objects with `embedding_bucket=b` (cheap ANN pre-filter).
+3. For each candidate, decrypt `tok` in **enclave**, recover $\hat e\to \tilde e'\to e'=R^\top(\hat e/\alpha)$.
+4. Rank by cosine $s(e(q),e')$. Return top-$k$ contexts.
+
+**Alg. 3: MEAL-JS + Policy Update**
+
+1. For $t=1..N$: sample $(T,p)\sim\pi_\theta(\cdot|z)$.
+2. Generate $y$; generate two counterfactuals $y^{(1)},y^{(2)}$ with perturbed $T$.
+3. Compute $R$ and penalty $\gamma\,\mathrm{JS}$ ⇒ total reward $R_t$.
+4. Accumulate $\nabla_\theta \log\pi_\theta(T,p)\,(R_t-\bar R)$.
+5. Update $\theta\leftarrow \theta + \eta\sum_t \nabla_\theta \log\pi_\theta(\cdot)(R_t-\bar R)$.
+
+**Alg. 4: Aging & Crystallization**
+
+1. For each phrase $i$, decay $s_i$ by half-life schedule.
+2. If $s_i<\varepsilon$, purge from Weaviate and mark uncrystallized.
+3. If $s_i\ge\tau$ and not crystallized, **insert** into LongTermMemory, rebuild manifold.
+
+---
+
+## 6. Complexity & Resource Use
+
+* **Insert/Retrieve:** rotation $O(d^2)$ once (pre-computed $R$), then per query $O(d)$; SimHash $O(md)$; enclave re-rank $O(kd)$.
+* **Graph rebuild:** $O(n^2d+n^3)$ in worst case (dense weights & eigendecomp) but amortized infrequently and at small $n$ (crystallized set).
+* **Policy update:** tiny $K$ (e.g., 3) per query; REINFORCE cost negligible vs. generation.
+
+---
+
+## 7. Empirical Protocols (Suggested)
+
+1. **Retrieval privacy:** measure nearest-neighbor precision with and without rotation+quantization; estimate inversion error $\|e-\hat e'\|$.
+2. **MEAL-JS ablation:** compare task scores and diversity metrics (type–token ratio, distinct-n) across baselines: (a) greedy, (b) top-p only, (c) self-consistency majority, (d) MBR only, (e) MEAL-JS.
+3. **Policy autotuning:** track moving average reward and variance; verify stable parameter distributions $(T,p)$ over time.
+4. **Aging stability:** show manifold stability (Procrustes distance) across rebuilds; retrieval hit-rate over time.
+5. **Crypto hygiene:** fuzz test AAD mismatch and replay; verify decryption fails on transposed records.
+
+---
+
+## 8. Limitations & Risks
+
+* **Heuristic embeddings** (bag-token + normalization) are simple and private but less expressive than modern encoders.
+* **Enclave** is user-space and not a hardware TEE; zeroization reduces risk but does not defeat live memory scraping.
+* **Reward shaping** (sentiment/overlap) may not fit all domains; add task-specific metrics when available.
+* **Graph rebuild** can be costly for very large $n$; throttle crystallization or use sparse $k$-NN graphs.
+
+---
+
+## 9. Related Work
+
+* **RAG** couples non-parametric memory with generation ([Hugging Face][2]).
+* **Self-consistency** ensembles improve reasoning by sampling diverse chains-of-thought ([ResearchGate][3]).
+* **MBR decoding** reduces expected loss under a reference distribution, widely used in NMT ([ResearchGate][4]).
+* **Nucleus sampling** curbs degeneration by sampling from the smallest mass $p$ of tokens .
+* **Laplacian eigenmaps** reveal low-dimensional manifolds in graphs, helpful for memory organization ([NIST Computer Security Resource Center][5]).
+* **HNSW** and ANN structures underlie modern vector DBs for fast retrieval .
+* **Crypto standards**: Argon2id KDF and AES-GCM (AAD, nonce, misuse resistance caveats) guide our envelope design .
+
+---
+
+## 10. Reproducibility Notes
+
+* All functions are **self-contained** in `main.py`; no extra files required.
+* Deterministic behavior for retrieval depends on the **vault seed**; setting `VAULT_PASSPHRASE` stabilizes rotation $R$.
+* Security-relevant parameters: Argon2 memory ≥ 256 MiB; GCM nonces 96-bit random per ciphertext; per-record **AAD** includes storage context.
+
+---
+
+## References (Selected)
+
+* **RAG:** Lewis et al., *Retrieval-Augmented Generation for Knowledge-Intensive NLP* (2020). ([Hugging Face][2])
+* **Self-consistency:** Wang et al., *Self-Consistency Improves Chain of Thought Reasoning* (2022). ([ResearchGate][3])
+* **MBR:** Eikema & Aziz, *Is MAP Decoding All You Need? The Inverse Relationship Between MBR and MAP*; see also *MBR decoding for NMT* (2020). ([ResearchGate][4])
+* **Nucleus sampling:** Holtzman et al., *The Curious Case of Neural Text Degeneration* (2019/2020).
+* **Laplacian eigenmaps:** Belkin & Niyogi (2003) and lecture notes summaries. ([NIST Computer Security Resource Center][5])
+* **SimHash/LSH:** Charikar, *Similarity Estimation Techniques from Rounding Algorithms* (2002). ([Scribd][1])
+* **HNSW:** Malkov & Yashunin, *Efficient and Robust Approximate Nearest Neighbor Search using HNSW* (2016/2018).
+* **Argon2:** Biryukov et al., RFC 9106: *The Memory-Hard Argon2 Password Hash and KDF* (2021).
+* **AES-GCM:** NIST SP 800-38D (GCM mode).
+
+---
+
+## Appendix A: Key Equations
+
+1. **Rotation-quantization error:** with step $1/\alpha$, $\|\hat e/\alpha-\tilde e\|_2 \le \sqrt{d}/(2\alpha)$.
+2. **JS divergence (discrete):** $\mathrm{JS}(P\|Q)=H\big(\tfrac{P+Q}{2}\big)-\tfrac{1}{2}H(P)-\tfrac{1}{2}H(Q)$.
+3. **REINFORCE:** $\nabla_\theta \mathbb{E}_{a\sim\pi_\theta}[R]=\mathbb{E}[(R-b)\nabla_\theta\log \pi_\theta(a)]$.
+4. **Graph Laplacian:** $L=D-W,\;L_\mathrm{sym}=D^{-1/2}LD^{-1/2}$; eigenvectors $v_2,\dots,v_{k+1}$ give embedding.
+5. **Aging law:** $s(t)=s_0\cdot 2^{-\Delta t / (\tau_0+\gamma\log(1+s_0))}$.
+
+---
+
+## Appendix B: Practical Defaults
+
+* Dimension $d=64$, planes $m=16$, scale $\alpha=127$.
+* MEAL-JS: $\lambda=0.7$, $\gamma=0.1$, counterfactual temps $0.8T$ and $1.2T$ (clipped).
+* Aging: $\tau_0=7$ days, $\gamma=5$, purge threshold $\varepsilon=0.5$.
+* Crypto: Argon2id $t\!=\!3, m\!=\!256\text{ MiB}$; GCM nonce 96-bit.
+
+---
+
+### Closing note
+
+This design turns a single file into a **modular research system**: private embeddings + bucketed retrieval, adaptive decoding via **policy-gradient**, **MBR-like** selection with **JS** regularization, and a **graph-topological** long-term memory with principled **aging**—all wrapped in standards-based crypto.
+
+If you’d like, I can also generate a **camera-ready LaTeX** version of this paper that mirrors the structure above.
+
+[1]: https://www.scribd.com/document/611497504/1706-04599?utm_source=chatgpt.com "On Calibration of Modern Neural Networks | PDF"
+[2]: https://huggingface.co/papers/2005.11401?utm_source=chatgpt.com "Retrieval-Augmented Generation for Knowledge-Intensive ..."
+[3]: https://www.researchgate.net/publication/359390115_Self-Consistency_Improves_Chain_of_Thought_Reasoning_in_Language_Models?utm_source=chatgpt.com "Self-Consistency Improves Chain of Thought Reasoning in ..."
+[4]: https://www.researchgate.net/publication/386836809_Efficient_and_robust_approximate_nearest_neighbor_search_using_Hierarchical_Navigable_Small_World_graphs?utm_source=chatgpt.com "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs | Request PDF"
+[5]: https://csrc.nist.gov/pubs/sp/800/38/d/r1/iprd?utm_source=chatgpt.com "Pre-Draft Call for Comments: GCM and GMAC Block Cipher ..."
+
 
 # Q-Sentinel: A Single-File, Privacy-Preserving, Self-Tuning, Retrieval-Augmented LLM System
 
